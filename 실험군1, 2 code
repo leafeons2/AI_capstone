@@ -1,0 +1,850 @@
+
+package myEdit;
+
+import org.cloudbus.cloudsim.brokers.DatacenterBroker;
+import org.cloudbus.cloudsim.brokers.DatacenterBrokerSimple;
+import org.cloudbus.cloudsim.cloudlets.Cloudlet;
+import org.cloudbus.cloudsim.cloudlets.CloudletSimple;
+import org.cloudbus.cloudsim.core.CloudSim;
+import org.cloudbus.cloudsim.core.events.SimEvent;
+import org.cloudbus.cloudsim.datacenters.Datacenter;
+import org.cloudbus.cloudsim.datacenters.DatacenterSimple;
+import org.cloudbus.cloudsim.hosts.Host;
+import org.cloudbus.cloudsim.hosts.HostSimple;
+import org.cloudbus.cloudsim.resources.Pe;
+import org.cloudbus.cloudsim.resources.PeSimple;
+import org.cloudbus.cloudsim.utilizationmodels.UtilizationModelDynamic;
+import org.cloudbus.cloudsim.utilizationmodels.UtilizationModelFull;
+import org.cloudbus.cloudsim.vms.Vm;
+import org.cloudbus.cloudsim.vms.VmSimple;
+import org.cloudsimplus.builders.tables.CloudletsTableBuilder;
+import org.cloudsimplus.listeners.EventInfo;
+import org.cloudsimplus.listeners.VmDatacenterEventInfo;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Scanner;
+import java.util.Vector;
+
+import org.cloudbus.cloudsim.schedulers.cloudlet.CloudletSchedulerSpaceShared;
+
+
+public class BasicFirstExample_myEdit 
+{
+    private static final int  HOSTS = 1;
+    private static final int  HOST_PES = 10000;
+    private static final int  HOST_MIPS = 1000_000;
+    private static final long  HOST_RAM = 600_000_000; //in KB, 최대값으로 본 것이 500GB 이상을 요구함
+                                                      // 1~51까지는 11GB로 충분(평균 이용 메모리)
+    private static final long HOST_BW = 10_000_000; //in Megabits/s
+    private static final long HOST_STORAGE = 1000_000_000; //in Megabytes
+    
+    private static final long EMERGENCY_SPACE_INIT_VALUE = 200_000_000;
+
+    private static final int VMS = 4;
+    private static final int VM_PES = 1;
+
+    private static final int VM_ANALYZE_FILES_PLUS_ONE = 201;
+    
+    private static final int CLOUDSIM_FINISH_TIME= 5000;
+    private static final double CLODSIM_UPDATE_RATE = 0.3;
+    private static final int VM_DESTROYER_COUNTER = 5;
+    
+    private static final int LOG_COUNTER = 500;
+    
+    private final CloudSim simulation;
+    private DatacenterBroker broker0;
+    private List<Vm> vmList;
+    private Datacenter datacenter0;
+    
+    /**
+     * 실패한 Vm들을 저장하는 공간, 추후 addAdditionalResult에서 다시 추가될 예정
+     */
+    
+    /**
+     * 만약 VM할당이 실패한 것이 있다면 True 가 됨으로써 vmlist에 새로운 Vm이 추가되는 것을 막는다.
+     * 그대신 옛 실패한 VM들이 다시 시행되길 시도한다
+     */
+    private boolean isFailedVmExist;
+    
+    
+    /**
+     * 몇번째 실행결과를 수행해야하는지 기록할 배열, 전부 0으로 초기화.
+     * 0개 완료됬으면 0이 들어가있다.
+     * 만약 Vm실행결과가 1개 들어있는 경우를 가정 / 인덱스는 1~1250(0은 안쓰임) ,  이 1개가 생성시도되면 VmWorkDone[i]는 1이된다.
+     */
+    int vmWorkDone[] = new int[1251];
+    
+    long emergencySpace = EMERGENCY_SPACE_INIT_VALUE;
+    
+    /**
+     * analyze VM 별 동시에 2개의 수행결과가 수행되지 않도록 막아주는 리스트
+     * 
+     * 예를들어 1번 VM이 300~600, 600~900 시간대에 도는 VM은 만약 검사를 여러번 할 시
+     *  1번 VM 수행결과가 동시대에 둘다 PM으로 올라올 수 있고, 이것은 바라는 결과가 아니다
+     *  
+     *  만약 해당 인덱스의 값이 true라면, Vm 수행결과를 싣지 않는 것으로 한다.
+     */
+    boolean vmWorkBeingProgressed[] = new boolean[1251];
+    
+    /**
+     * VM ID 당 각각 Peak 상태에 있는지 기록
+     */
+    
+    boolean currentlyInMaxValue[] = new boolean[1251];
+    
+    /**
+     * VM ID 당 각각 Peak 상태가 되는것을 시도해봤는지 기록
+     */
+    boolean triedMaxValue[] = new boolean[1251];
+    
+    /**
+     * VM ID 당 각각 Peak 상태를 완료했는지 기록하는 Boolean 배열
+     */
+    
+    boolean doneMaxValue[] = new boolean[1251];
+    
+    /**
+     * 정확히는 현재 시간대라기보단, 어느 Timestamp까지 VM 수행결과가 완료되었는지를 뜻한다
+     */
+    double currentTimestamp=0;
+    
+    /**
+     * allVmWorkResults에 각 원소는 analyze 파일 1개이다.
+     */
+    Vector allVmWorkResults = TxtFileInput.txtFileReading();
+    
+    /**
+     *  예측에 실패한것에 이어서, 비상공간까지 모자랐던 횟수를 셈
+     */
+    int failedMaxAllocationCount = 0;
+    
+    /**
+     *  결과로그가 뜨는 횟수를 조절함
+     */
+    int loggerTimer = 0;
+
+    /**
+     * 제거된 VM 수가 5가 되면 pause -> 새로 수행될 VM 추가가 이어진다
+     * @param 
+     */
+    
+    int vmDestroyedCount = 0;
+    
+    /**
+     *  1회 Max Memory Utilization 출력을 했으면 그만두도록 만들기 위함
+     */   
+    
+    boolean didMaxMemoryUtilization = false;
+    
+    
+    /**
+     * 
+     *  매 시간 Tick 당 Memory Utilization rate을 저장하는 Vector 
+     */
+    
+    Vector<Double> memoryUtilization_tick = new Vector<Double>();
+    
+    
+    /**
+     * 
+     *  VM 배치 실패시 (가장 가득 찼을 시) Memory Utilization rate을 저장하는 Vector 
+     */
+    
+    Vector<Double> memoryUtilization_vmfail = new Vector<Double>();
+    
+   
+    /**
+     *   연결과 관련된 Socket, Stream들 존재
+     *
+     */
+    Connectings connector = createConnectings();
+    
+    
+    /**
+     *  전반적인 수행에 있어서 가장 VM들이 많이 올라올떄의 개수가 무엇인지 저장
+     * 
+     */
+    
+    int maxVmAllocationCount =0;
+    
+    
+    /**
+     * 
+     *   실행되는 중에 비상공간 필요량의 최대치
+     */
+    
+    int memoryNeedMax = 0;
+    
+    
+    /**
+     *   실패한 시간 기록을 시작하여 어떤 변수에 실패 시간을 기록했음을 뜻함
+     */
+    boolean failTimeRecordFlag = false;
+    
+    /**
+     *   실패한 시간의 시작 시간
+     */
+    double failTimeStart = 0;
+    
+    /**
+     *  실패한 시간들의 결과들을 기록하는 Vector
+     */
+    
+    Vector<Double> failTimeLengthVector = new Vector<Double>();
+    
+    
+   
+    public static void main(String[] args) {
+        new BasicFirstExample_myEdit();
+    }
+
+    /*메세지 로그 활성화 명령어   
+      import org.cloudsimplus.util.Log;   Log.setLevel(ch.qos.logback.classic.Level.WARN); */
+    
+    private BasicFirstExample_myEdit()   
+    {
+    	
+    	simulation = new CloudSim();
+    	datacenter0 = createDatacenter();
+    	broker0 = new DatacenterBrokerSimple(simulation);
+    	
+    	
+    	
+    	vmList = new ArrayList<Vm>(1250); // 필요시 가변적으로 변하는 배열, 1250 수는 debugging 효과가 없을듯
+    	
+    	simulation.addOnSimulationPauseListener(this::addAdditionalResults); 
+    	  // 아래 참조, 시뮬레이션이 정지할때마다 실행할 VM을 불러옴
+    	//simulation.addOnClockTickListener(this::checkIfResultEnded);  결국 거의 안쓰이는 기능, 줄만 잡아먹음
+    	
+    	simulation.addOnClockTickListener(this::vmDestroyer_updator);
+    	// 아래 참조, VM이 수행시간만큼 PM위에 위치하면 파괴하는 역할
+    	
+    	simulation.addOnClockTickListener(this::logger);
+    	
+    	
+    	simulation.terminateAt(CLOUDSIM_FINISH_TIME);
+    	
+    	broker0.addOnVmsCreatedListener(this::brokerVmPlaceTryDone);
+    	broker0.getVmCreation().setMaxRetries(0);
+    	broker0.getVmCreation().setRetryDelay(-1);
+    	
+    	this.makeVmResultList();  // vmList에 소량의 VM 수행결과가 들어옴
+    		
+        broker0.submitVmList(vmList);
+        
+        
+
+        simulation.start(); 
+
+        //final List<Cloudlet> finishedCloudlets = broker0.getCloudletFinishedList();
+        //new CloudletsTableBuilder(finishedCloudlets).build();
+    }
+    
+    private void logger(EventInfo pauseInfo)
+    {
+    	double result;
+    	double value;
+    	
+    	if(loggerTimer < LOG_COUNTER )
+    	{
+    		loggerTimer++;
+    	}
+    	else
+    	{
+    		System.out.println("failed Max allocation Count so far : " + failedMaxAllocationCount);
+    		
+    		result = printingUtilization();
+    		
+    		memoryUtilization_tick.add(result);
+    		
+    		loggerTimer = 0;
+    		
+    		
+    		if(maxVmAllocationCount <= broker0.getVmExecList().size())
+    		{
+    			maxVmAllocationCount = broker0.getVmExecList().size();
+    		}
+    		
+    		
+    		
+    		if(pauseInfo.getTime() >= CLOUDSIM_FINISH_TIME - 200)
+        	{
+        		System.out.println("Printing memoryUtilization_tick");
+        		for(int i=0; i<memoryUtilization_tick.size(); i++)
+        		{
+        			value = memoryUtilization_tick.get(i);
+        			System.out.printf("%.1f %n",value);
+        		}
+        		System.out.println("Printing memoryUtilization_vmfail");
+        		for(int i=0; i<memoryUtilization_vmfail.size(); i++)
+        		{
+        			value = memoryUtilization_vmfail.get(i);
+        			System.out.printf("%.1f %n", value);
+        		}
+        		
+        		System.out.println("printing failTimeLengthVector");
+        		for(int i=0; i<failTimeLengthVector.size(); i++)
+        		{
+        			value = failTimeLengthVector.get(i);
+        			System.out.printf("%.1f %n", value);
+        		}
+        		
+        		System.out.printf("maxVmAllocationCount So far was %d %n", maxVmAllocationCount);
+        		
+        		System.out.printf("memoryNeedMax So far was %d %n", memoryNeedMax);
+        		
+        		closeConnectings();
+        	}
+    		
+    	}
+    	
+    }
+
+    /**
+     * 현재 메모리 이용량 / (할당한 용량  + 비상공간용량)  * 100 의 값을 출력함
+     */
+    private double printingUtilization()
+    {
+    	int broker0ExecListSize;
+    	int id_temp;
+    	long memoryUsageSum = 0;
+    	long memorySizeSum = 0;
+    	int memoryUsageTemp;
+    	double result;
+    	VmWorkResult vmWorkResultTemp;
+    	
+    	List <Vm> broker0ExecList =  broker0.getVmExecList();
+		broker0ExecListSize =broker0ExecList.size();
+    	for (int i=0; i< broker0ExecListSize; i++)
+    	{
+    		Vm vm = broker0ExecList.get(i); // 실행되고 있는 모든 Vm에 대해 다음을 반복
+    		id_temp = (int) vm.getId();
+    		vmWorkResultTemp = (VmWorkResult) allVmWorkResults.get(id_temp); 
+    		
+    		if( currentlyInMaxValue[id_temp] == true)
+    		{
+    			memoryUsageTemp = (int) vmWorkResultTemp.getMemMax(vmWorkDone[id_temp]-1);
+    			memoryUsageSum += memoryUsageTemp;
+    		}
+    		else
+    		{
+    			memoryUsageTemp = (int) vmWorkResultTemp.getMemAvg(vmWorkDone[id_temp]-1);
+    			memoryUsageSum += memoryUsageTemp;
+    		}
+    	}
+    	
+    	memorySizeSum = datacenter0.getHost(0).getRam().getAllocatedResource() + EMERGENCY_SPACE_INIT_VALUE;
+    	//memorySizeSum = HOST_RAM + EMERGENCY_SPACE_INIT_VALUE;
+    	
+    	result = (double) memoryUsageSum / (double)memorySizeSum * 100;
+    	
+    	System.out.printf("Memory Utilization rate was %.1f %n", result);
+    	
+    	return result;
+    }
+    
+
+    
+    private int makeVmResultList()
+    {
+    	// System.out.println("currently on 'makeVmResultList' ");
+    	
+    	/**
+    	 *  만약 생성된 Vm이 1개도 없었다면 다시 읽어오게 해야한다.
+    	 */
+    	int result = 0;
+    	VmWorkResult vmWorkResult;
+    	
+    	
+    	for(int i= 1; i<VM_ANALYZE_FILES_PLUS_ONE; i++)  // 모든 analyze 파일 검사.
+    	{
+    		vmWorkResult = (VmWorkResult) allVmWorkResults.get(i);
+    		if(vmWorkDone[i] <  vmWorkResult.getLength()) // 어떤 VM에 대해 아직 모든 수행결과 미완시 아래 수행 
+    		{                                                                                     
+    			if( ( currentTimestamp >= vmWorkResult.getStartTimestamp(vmWorkDone[i]) ) && (vmWorkBeingProgressed[i] == false) ) 
+    				// 현재 시간 값이 startTimestamp를 지났다면, 배치되어야 할 차례이다.   + vm 수행결과가 중첩되지 않음
+    			{
+    				System.out.println("Vm" + (i) +"'s result is getting created due to currentTImestamp =" + currentTimestamp + "vm startTimestamp :"  + (vmWorkResult).getStartTimestamp(vmWorkDone[i]) );
+    				//System.out.println("testing :" + vmWorkResult.getMemAvg(vmWorkDone[i]));
+    				
+    				// 메모리 이용량 예측을 이용한 생성
+    				int estimatedMemoryUsage = returnEstimate(vmWorkResult, i, connector);
+        			Vm vm =createOneVm( i , estimatedMemoryUsage);
+        			
+        			// 평균 메모리의 2배만큼 할당해서 생성
+    			    //Vm vm =createOneVm( i, (int)vmWorkResult.getMemAvg(vmWorkDone[i]) *2 );
+    				
+    				vmList.add(vm); //VM ID와 VM 평균 메모리 이용량 전달
+    				
+    				vmWorkDone[i]++;
+    				vmWorkBeingProgressed[i] = true;
+    				result = 1;
+    			}
+    		}
+    	}
+    	return result;
+    }
+    
+    private Connectings createConnectings()
+    {
+    	try
+    	{
+    		Connectings temp = GetMaxClient.GetConnectings();
+    		
+    		return temp;
+    	}
+    	catch (Exception e)
+    	{
+    		System.out.println("Error occurred while creating Connectings");
+    		
+    		return null;
+    	}
+    }
+    
+    private void closeConnectings()
+    {
+    	try
+    	{
+    		connector.socket.close();
+    	}
+    	catch (Exception e)
+    	{
+    		System.out.println("Error occured while closing socket");
+    	}
+    	
+    }
+    
+    
+    private int returnEstimate(VmWorkResult vmWorkResult_infunction, int vmID, Connectings socketAndStreams)
+    {
+		try 
+		{
+			int estimate = (int) GetMaxClient.GetMax(vmWorkResult_infunction.getCpuAvg(vmWorkDone[vmID]), vmWorkResult_infunction.getMemAvg(vmWorkDone[vmID]), socketAndStreams);
+			return estimate;
+            
+        } catch (Exception e) {
+            System.out.println("Error occurred: " + e.getMessage());
+            
+            return (int) vmWorkResult_infunction.getMemAvg(vmWorkDone[vmID]) * 2;
+        }
+		
+    }
+
+    
+    private void vmDestroyed_counter()
+    {
+    	vmDestroyedCount++;
+    	if(vmDestroyedCount == VM_DESTROYER_COUNTER)  // 추후 10으로 변경가능.
+    	{
+    		vmDestroyedCount = 0;
+    		simulation.pause();
+    	}
+    }
+    
+    private void addAdditionalResults(EventInfo pauseInfo)
+    {
+    	System.out.println("currently on 'addAdditionalResults' ");
+   
+    	int breakTest=0;
+    	int saveVmListSize = vmList.size();
+    	int saveFailedVmListSize;
+    	
+    	Vm oneFailedVm;
+    	Vm reincarnationVm;
+    	
+    	List <Vm> failedVmList;
+    	
+    	for(int i=0; i<saveVmListSize; i++)
+    	{
+    		vmList.remove(0);  // 완성된 vm들 전부 제거
+    	}
+    	
+    	
+    	if(isFailedVmExist== true)
+    	{
+    		System.out.printf("currently in retry mode current Available : %d %n", datacenter0.getHost(0).getRam().getAvailableResource());
+    		int FailedVmID;
+    		
+    		failedVmList = broker0.getVmFailedList();
+    		saveFailedVmListSize = failedVmList.size();
+    		for(int i=0; i< saveFailedVmListSize; i++)
+    		{
+    			oneFailedVm = failedVmList.get(0);
+    			FailedVmID = (int) oneFailedVm.getId();
+    			
+    			System.out.printf("Vm %d's result is getting retried need : %d %n", FailedVmID , oneFailedVm.getRam().getCapacity() ); // 예측된 값이 다시한번 들어올 예정
+    			reincarnationVm =createOneVm( FailedVmID , (int) oneFailedVm.getRam().getCapacity());
+    			
+    			vmList.add(reincarnationVm);
+    			
+    			failedVmList.remove(0);
+    		}
+    		//didMaxMemoryUtilization = false;
+    	}
+    	
+    	else
+    	{
+    		while(this.makeVmResultList() == 0)  // vm이 리스트에 1개라도 추가된 1이 나올때까지 반복
+    		{
+    			currentTimestamp += 900;   // 더 많은 VM 수행결과들이 추가될수 있도록 timestamp 증가
+    			breakTest++;
+    			if(breakTest >= 2880)  // 끝나는 시간 2591952 최대값 반영한 것. 언젠가 탈출은 하며, 탈출시 꼭 1개의 VM이 생성되거나 모두 완료됨
+    			{
+    				currentTimestamp -= 2880*900;
+    				break;
+    			}
+    			// 사용안하는 검사기능, 어떤 Analyze 파일이 완료가 되면 매번 vmWorkBeingProgressed[i]가 False기에 문제가 있음
+    			   //  + 동시에 올라와지는  VM이 없음
+    			/*breakTest2 = 1;
+
+    			for(int i =1 ; i< VM_ANALYZE_FILES_PLUS_ONE; i++)
+    			{
+    				if(vmWorkBeingProgressed[i] == false) // 아직 올라올 수 있는 VM 이 존재
+    				{
+    					breakTest2 = 0;
+    				}
+    			}
+    			if(breakTest == 1) // 올라올 수 있는 VM이 존재하지 않으면 추가가 불가능한 무한반복에 빠지기에, break로 탈출해버림.
+    				break;
+    			 */
+    		}
+    		
+    	}
+    	
+    	broker0.submitVmList(vmList); // 중첩되서 적용되지 않는 것 같으나
+    	                               // 이미 생성된 것을 다시한번 생성하려다가 빨간글씨로 나타남
+    	                               // 740개로 1회차에 제작 111개로 2회차에 제작됬으면 VM이 제작되는것은 851개는 맞음
+    	                               // 그러나 740개가 생성됬는데도 다시 생성되라고 누적되기에 다른 Host를 찾다가 실패한다.
+    	                               // 표시는 740 + 111 + 740 개 중  740 + 111개가 생산실패됬다고 뜸
+    	
+    	                               //  해결완료 
+    	simulation.resume();
+    	
+    }
+    
+    /*
+    private void checkIfResultEnded(EventInfo pauseInfo)
+    {
+    	System.out.println("currently on 'checkIfResultEnded' ");
+    	if(currentTimestamp > (double)2800000)   //2591952가 최대값
+    	{
+    		simulation.terminate();
+    	}
+    }
+    */
+    
+    
+    private void vmDestroyer_updator (EventInfo pauseInfo)
+    {
+    	System.out.println("currently on 'vmDestroyer' ");
+    	double runningTime;
+    	int id_temp;
+    	
+    	VmWorkResult vmWorkResult_temp;
+       
+    	List <Vm> broker0ExecList =  broker0.getVmExecList();
+    	
+    	for(int i=0; i< broker0ExecList.size() ; i++) // 생성된 모든 VM 검사
+    	{
+    		Vm vm = broker0ExecList.get(i);
+    		if ( vm.isCreated() )
+    		{
+    			
+    			id_temp = (int) vm.getId();
+    			vmWorkResult_temp = ((VmWorkResult) allVmWorkResults.get(id_temp));
+    			runningTime = vmWorkResult_temp.getRunningTime(vmWorkDone[id_temp]-1); //  생성되면 vmWorkDone[] 가 1증가한다. 생성된 VM의 값을 접근하려면 -1을 해야함.
+    			if(  runningTime/1000 < pauseInfo.getTime() - vm.getCreationTime() ) //ID에 해당하는 VM의 RunningTime    보다    현재시간 - Vm이 생성된 시간이 더 크면 종료되어야 함
+    			{
+    				System.out.println("destroyed VM :" + (id_temp) + "    due to runningTime :  " + runningTime/1000);
+    				System.out.println("\t\t pauseInfo.getTime() - vm.getCreationTime() :" + (pauseInfo.getTime()- vm.getCreationTime()));  
+    				datacenter0.getHostList().get(0).destroyVm(vm);
+    				i--; // 원소가 1개 삭제되면 그 빈자리에 자동으로 다음 원소가 오게 되므로 모두 검사하기 위해 필요함
+    				
+    				vmWorkBeingProgressed[id_temp] = false;
+    				
+    				doneMaxValue[id_temp] = false;
+    				triedMaxValue[id_temp] = false;
+    				
+    				vmDestroyed_counter();
+    			}    		
+    		}
+    	}
+    	changeToPeakIfNeeded(pauseInfo.getTime());
+    }
+    
+    private void changeToPeakIfNeeded(double pauseTime)
+    {
+    	int emergencySpaceChangeResult;
+    	int broker0ExecListSize;
+    	
+    	double peakTime;
+    	int peakMemory;
+    	int memoryNeed;
+    	double runningTime;
+    	int id_temp;
+    	
+    	List <Vm> broker0ExecList =  broker0.getVmExecList();
+    	VmWorkResult vmWorkResult_temp;
+    	
+    	
+    	System.out.println("currently on 'changeToPeakIfNeeded' ");
+    	broker0ExecListSize =broker0ExecList.size();
+    	for (int i=0; i< broker0ExecListSize; i++)
+    	{
+    		Vm vm = broker0ExecList.get(i); // 실행되고 있는 모든 Vm에 대해 다음을 반복
+    		id_temp = (int) vm.getId();  
+    		vmWorkResult_temp = ((VmWorkResult) allVmWorkResults.get(id_temp));  // vm 에 해당하는 Analyze 파일을 불러옴 
+    		runningTime = vmWorkResult_temp.getRunningTime(vmWorkDone[id_temp]-1); // 현재 수행되는 vm이기에 -1 필요, 돌아야하는 시간 값 호출
+    		
+    		peakTime = vmWorkResult_temp.getMemMaxTime(vmWorkDone[id_temp]-1); // peak가 되는 시간
+    		peakMemory = (int) vmWorkResult_temp.getMemMax(vmWorkDone[id_temp]-1);
+    		memoryNeed = (int) ( peakMemory - vm.getRam().getCapacity() ); // (실제 최대값) - (예측 최대값),  양수면 부족
+    		
+    		if(memoryNeed >= memoryNeedMax)
+    		{
+    			memoryNeedMax = memoryNeed;
+    		}
+    		
+    		
+    		if(doneMaxValue[id_temp] == false && triedMaxValue[id_temp] == false )  // 아직 최대값이 되지 않은 VM들에 대해
+    		{
+    			if(runningTime - peakTime > 900 && (memoryNeed >=0 ) ) // Peak가 VM 완료 근처에서 일어나지 않는 것들  + 예측에 실패해 메모리가 더 필요한 것들에 대해
+    			{
+    				if(peakTime/1000 < pauseTime - vm.getCreationTime()) //현재 PeakTime 일 시간인경우
+    				{
+    					emergencySpaceChangeResult = emergencySpaceValueChange( memoryNeed * -1); // 비상공간 차감
+    					switch(emergencySpaceChangeResult)
+    					{
+    						case 0:
+    						{
+    							System.out.println("trying changing to maxValue  VM :" + (id_temp) + "    due to peakTime :  " + peakTime/1000);
+    		    				System.out.println("\t\t pauseTime - vm.getCreationTime() :" +  (pauseTime - vm.getCreationTime()));
+    		    				
+    							System.out.printf("Emer. memory decrement success  capacity : %d  MemoryNeed : %d %n%n",  emergencySpace + memoryNeed, memoryNeed );
+    							
+    							currentlyInMaxValue[id_temp] = true;
+    							
+    							break;
+    						}
+    						case 1:
+    						{
+    							System.out.println("trying changing to maxValue  VM :" + (id_temp) + "    due to peakTime :  " + peakTime/1000);
+    		    				System.out.println("\t\t pauseTime - vm.getCreationTime() :" +  (pauseTime - vm.getCreationTime()));  
+    		    				
+    						    System.out.printf("there was not enough Emer. memory  capacity : %d  MemoryNeed : %d %n%n", emergencySpace, memoryNeed );
+    						    failedMaxAllocationCount++;
+    							break;
+    						}
+    						case 2:
+    						{
+    							System.out.println("overflow of Emer. memory");
+    							simulation.terminate();
+    							break;
+    						}
+    					}
+    					
+    					triedMaxValue[id_temp] = true;  // 평균값으로 돌아오기 위한 과정
+    				}
+    			}
+    			
+    		}
+    		
+			
+			if( currentlyInMaxValue[id_temp] == true)
+			{
+				if ( peakTime/1000 + 0.3 <= pauseTime - vm.getCreationTime() )  // 다음 0.3초뒤에는 공간반환 예정
+				{
+					emergencySpaceChangeResult = emergencySpaceValueChange( memoryNeed * 1);
+					switch(emergencySpaceChangeResult)
+					{
+						case 0:
+						{
+							System.out.println("returning to AvgValue  VM :" + (id_temp) +" due to peakTime + 0.3 :" + ( peakTime/1000 + 0.3) );
+		    				System.out.println("\t\t pauseTime - vm.getCreationTime() :" +  (pauseTime - vm.getCreationTime()));
+		    				
+							System.out.printf("Emer. memory increment success  cur. capacity : %d %n%n", emergencySpace);
+							break;
+					
+						}
+						case 1:
+						{
+							System.out.println("there was a problem while returning to Avg Value");
+							simulation.terminate();
+							
+							break;
+						}
+						case 2:
+						{
+							System.out.println("overflow of Emer. memory");
+							simulation.terminate();
+							break;
+						}
+					}
+					currentlyInMaxValue[id_temp] = false;
+					doneMaxValue[id_temp] = true;
+				}
+			}
+    	}
+    }
+    
+    private void brokerVmPlaceTryDone (EventInfo pauseInfo )
+    {
+    	System.out.println("currently on 'brokerVmPlaceTryDone' ");
+    	
+    	if(broker0.getVmFailedList().size() == 0)
+    	{
+    		isFailedVmExist = false;
+    		didMaxMemoryUtilization = false;
+    	}
+    	
+    	if( ( failTimeRecordFlag == true ) && (broker0.getVmFailedList().size() == 0))
+    	{
+    		System.out.printf("failTimeLength was %.1f %n", pauseInfo.getTime() - failTimeStart);
+    		failTimeLengthVector.add(pauseInfo.getTime() - failTimeStart);
+    		failTimeRecordFlag = false;
+    	}
+    	
+    	simulation.pause(); // 이 함수가 끝나면 pauseListener기능으로 이동함. + pause됨
+    }
+    
+    
+    private Vm createOneVm(int id, int memUsage)
+    {
+    	
+    	Vm vm= new VmSimple(HOST_MIPS, VM_PES);  //Memory와 관련없는 영역은 전부 1로 대치
+    	vm.addOnCreationFailureListener(this::failedListExist);  // 실패시 가끔 무조건 정지하는 문제 해결해줄지도?
+    	vm.setRam(memUsage).setBw(1).setSize(1).setId(id);  // id는 1.analyze 이면 id는 1이됨.
+    	
+    	return vm;
+    	
+    }
+    
+    private void failedListExist(VmDatacenterEventInfo failureInfo)
+    {
+    	Vm vm = failureInfo.getVm();
+    	
+    	double result;
+    	
+    	System.out.printf("vm ID : %d  lack of host memory    current Available : %d , need : %d %n", vm.getId(), datacenter0.getHost(0).getRam().getAvailableResource(), vm.getRam().getCapacity()); 
+    	
+    	// vmList.remove(vm); - 더이상 다시 재시도를 하지 않도록 하는게 필요한데? vmList를 바꾼다고 재시도 하는 것이 달라지진 않아
+    	
+        isFailedVmExist = true;
+        
+        if(didMaxMemoryUtilization == false)
+        {
+        	System.out.printf("Max Utilization, memory Utilization was...%n");
+        	
+        	result = printingUtilization();
+        	memoryUtilization_vmfail.add(result);
+        	didMaxMemoryUtilization = true;
+        }
+        
+        if (failTimeRecordFlag == false)
+        {
+        	failTimeStart = failureInfo.getTime();
+        	failTimeRecordFlag = true;
+        }
+        
+        
+        
+
+    }
+    
+    private int emergencySpaceValueChange(int amount)
+    {
+    	if( emergencySpace + amount < 0 )
+    	{
+    		return 1; // 공간부족으로 값을 변경하지 않음
+    	}	
+    	else if (emergencySpace + amount > EMERGENCY_SPACE_INIT_VALUE)
+    	{
+    		return 2;  // 불가능한 상황, 뭔가 문제가 생긴게 분명함.
+    	}
+    	else
+    	{
+    		emergencySpace += amount;
+    		return 0;
+    	}
+    	
+    }
+        
+    
+    
+    private Datacenter createDatacenter() {
+        final var hostList = new ArrayList<Host>(HOSTS);
+        for(int i = 0; i < HOSTS; i++) {
+            final var host = createHost();
+            hostList.add(host);
+        }
+
+        //Uses a VmAllocationPolicySimple by default to allocate VMs
+        DatacenterSimple dataCenter = new DatacenterSimple(simulation, hostList);
+        dataCenter.setSchedulingInterval(CLODSIM_UPDATE_RATE);
+        return dataCenter;
+    }
+
+    private Host createHost() {
+        final var peList = new ArrayList<Pe>(HOST_PES);
+        //List of Host's CPUs (Processing Elements, PEs)
+        for (int i = 0; i < HOST_PES; i++) {
+            //Uses a PeProvisionerSimple by default to provision PEs for VMs
+            peList.add(new PeSimple(HOST_MIPS));
+        }
+
+        /*
+        Uses ResourceProvisionerSimple by default for RAM and BW provisioning
+        and VmSchedulerSpaceShared for VM scheduling.
+        */
+        return new HostSimple(HOST_RAM, HOST_BW, HOST_STORAGE, peList);
+    }
+
+    
+    /**
+     * Creates a list of VMs.
+     */
+    /*
+    private List<Vm> createVms() {
+        final var vmList = new ArrayList<Vm>(VMS);
+        for (int i = 0; i < VMS; i++) {
+            //Uses a CloudletSchedulerTimeShared by default to schedule Cloudlets
+            final var vm = new VmSimple(HOST_MIPS, VM_PES);
+            vm.addOnCreationFailureListener(null);
+            vm.setRam(2048).setBw(1000).setSize(10000);
+            
+            vm.setCloudletScheduler(new CloudletSchedulerSpaceShared()); //length, Utilization rate 으로 수행 시간이 결정되고
+                                                                          // 동시에 시행되는 Cloudlet 개수는 VM의 PE수로 결정된다.
+            vmList.add(vm);
+        }
+
+        return vmList;
+    }
+    */
+
+    /**
+     * Creates a list of Cloudlets.
+     */
+    /*
+    private List<Cloudlet> createCloudlets() {
+        final var cloudletList = new ArrayList<Cloudlet>(CLOUDLETS);
+
+        //UtilizationModel defining the Cloudlets use only 50% of any resource all the time
+        final var utilizationModel = new UtilizationModelFull();  // 이것을 0.1로 바꾸니까 timeshared 모드에서 이상한 값이 안나옴
+                                                                        // cloudlet당 이용하는 자원을 매우 낮춘 결과.
+                                                                        // 하지만 자원이 적어진만큼 더 오랜 시간이 걸린다
+
+        for (int i = 0; i < CLOUDLETS; i++) {
+            final var cloudlet = new CloudletSimple(CLOUDLET_LENGTH, CLOUDLET_PES, utilizationModel);
+            cloudlet.setSizes(1024);
+            cloudletList.add(cloudlet);
+        }
+        
+
+        return cloudletList;
+    }
+    */
+}
